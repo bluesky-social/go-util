@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# uses tools:
+# go install github.com/bufbuild/buf/cmd/buf@v1.54.0
+# go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.18.1
+# go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
+# protoc (C++ binary from https://github.com/protocolbuffers/protobuf or most package managers)
+# (as of 2024-08-01)
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+PROTO_DIR="${1:-}"
+
+if [[ "${PROTO_DIR}" == "" ]]; then
+  echo "Usage: $0 <PROTO_DIR>"
+  exit 1
+fi
+
+# Enter project directory
+pushd "${PROTO_DIR}" >/dev/null
+
+PKG="$(basename "${PROTO_DIR}")"
+
+# Protobuf and RPC codegen.
+buf lint
+buf generate
+
+# Move the generated Connect code into top directory.
+# in the future, we probably will separate this out.
+if [[ -e "${PKG}connect/${PKG}.connect.go" ]]; then
+  mv "${PKG}connect/${PKG}.connect.go" .
+  rmdir "${PKG}connect"
+
+  # Remove unnecessary/broken import.
+  sed -i.bak 's#\t__ "./"##' "${PKG}.connect.go"
+
+  # Move the generated code to our top level package.
+  sed -i.bak "s#package ${PKG}connect#package ${PKG}#" "${PKG}.connect.go"
+
+  # Remove package qualification, since it's all in our top level package.
+  sed -i.bak 's#__\.##g' "${PKG}.connect.go"
+
+  # Clean up .bak file. This was required to make sed in-place flag work the same on mac and linux.
+  rm "${PKG}.connect.go.bak"
+
+  # Run go fmt.
+  go fmt "${PKG}.connect.go" >/dev/null
+fi
+
+popd >/dev/null
