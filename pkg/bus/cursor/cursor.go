@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/go-util/pkg/bus"
@@ -35,7 +36,8 @@ type Cursor[M proto.Message] struct {
 	deserializer   serde.Deserializer
 	topic          string
 	logger         *slog.Logger
-	group          string
+	group     string
+	closeOnce sync.Once
 
 	saslUsername string
 	saslPassword string
@@ -99,6 +101,7 @@ func New[M proto.Message](
 
 	// Ensure the topic exists
 	if err := kafka.EnsureTopic(ctx, producerClient, cfg); err != nil {
+		producerClient.Close()
 		return nil, fmt.Errorf("failed to ensure topic %s exists: %w", topic, err)
 	}
 
@@ -108,6 +111,7 @@ func New[M proto.Message](
 
 	consumerClient, err := kafka.NewKafkaClient(cfg, conOpts)
 	if err != nil {
+		producerClient.Close()
 		return nil, fmt.Errorf("failed to create consumer client: %w", err)
 	}
 	cursor.consumerClient = consumerClient
@@ -146,23 +150,38 @@ func (c *Cursor[M]) Save(ctx context.Context, message M) error {
 }
 
 func (c *Cursor[M]) Load(ctx context.Context, isFinal func(M) bool) (M, error) {
-	cursorLoadContext, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cursorLoadContext, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+
 	var m M
+	found := false
+	connected := false
 
 	// Make sure we've got the latest cursor before we return it.
 	// When a cursor caller shuts down, they may save the cursor on exit so if we start consuming immediately,
 	// we might miss the last message they saved.
 	for {
-		select {
-		case <-cursorLoadContext.Done():
-			return m, nil
-		default:
+		fetches := c.consumerClient.PollFetches(cursorLoadContext)
+		if fetches.IsClientClosed() {
+			return m, errors.New("cursor consumer client is closed")
+		}
+		if errs := fetches.Errors(); len(errs) > 0 {
+			// If we timed out and successfully connected but never saw any records,
+			// the cursor topic is empty — that's not an error, there's just no cursor saved yet.
+			// If we timed out without ever getting a successful fetch, the cluster is unreachable.
+			if errors.Is(errs[0].Err, context.DeadlineExceeded) && connected && !found {
+				return m, nil
+			}
+			return m, fmt.Errorf("failed to fetch records: %v", errs)
 		}
 
-		fetches := c.consumerClient.PollFetches(cursorLoadContext)
-		if errs := fetches.Errors(); len(errs) > 0 {
-			return m, fmt.Errorf("failed to fetch records: %v", errs)
+		// A successful fetch (even with zero records) means the cluster is reachable.
+		connected = true
+
+		// If we're not waiting for a specific cursor state and the topic is empty, return immediately
+		// rather than blocking for the full timeout duration.
+		if isFinal == nil && len(fetches.Records()) == 0 {
+			return m, nil
 		}
 
 		// Keep the last record and return it
@@ -177,21 +196,33 @@ func (c *Cursor[M]) Load(ctx context.Context, isFinal func(M) bool) (M, error) {
 				return m, fmt.Errorf("received unexpected message type: %T", data)
 			}
 			m = message
+			found = true
 		}
 
 		// If we have a final check function, use it to determine if the previously saved cursor is the final one.
-		if isFinal != nil && isFinal(m) {
+		if found && isFinal != nil && isFinal(m) {
+			return m, nil
+		}
+
+		// If isFinal is nil and we found a record, return it immediately.
+		if found && isFinal == nil {
 			return m, nil
 		}
 	}
 }
 
-func (c *Cursor[M]) Close() error {
-	c.producerClient.Close()
-	// Delete consumer offsets to clean up after ourselves.
-	if err := kafka.DeleteOffsets(context.Background(), c.consumerClient, c.group, c.topic, []int32{0}); err != nil {
-		c.logger.Error("failed to delete offsets", "err", err)
-	}
-	c.consumerClient.Close()
-	return nil
+func (c *Cursor[M]) Close() {
+	c.closeOnce.Do(func() {
+		c.producerClient.Close()
+
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Delete consumer offsets to clean up after ourselves.
+		if err := kafka.DeleteOffsets(deleteCtx, c.consumerClient, c.group, c.topic, []int32{0}); err != nil {
+			c.logger.Error("failed to delete offsets", "err", err)
+		}
+
+		c.consumerClient.Close()
+	})
 }
