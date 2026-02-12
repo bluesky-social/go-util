@@ -162,9 +162,6 @@ func (c *Cursor[M]) Load(ctx context.Context, isFinal func(M) bool) (M, error) {
 
 		fetches := c.consumerClient.PollFetches(cursorLoadContext)
 		if errs := fetches.Errors(); len(errs) > 0 {
-			if errors.Is(errs[0].Err, context.DeadlineExceeded) {
-				return m, nil
-			}
 			return m, fmt.Errorf("failed to fetch records: %v", errs)
 		}
 
