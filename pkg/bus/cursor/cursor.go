@@ -36,8 +36,8 @@ type Cursor[M proto.Message] struct {
 	deserializer   serde.Deserializer
 	topic          string
 	logger         *slog.Logger
-	group     string
-	closeOnce sync.Once
+	group          string
+	closeOnce      sync.Once
 
 	saslUsername string
 	saslPassword string
